@@ -44,9 +44,10 @@ const canvasToBlob = (canvas: HTMLCanvasElement, mime: string, quality?: number)
   );
 
 // Vectorize a raster image into real SVG paths using imagetracerjs.
-// Images are scaled down to max 1000px before tracing for reasonable speed.
-const toTracedSVG = (img: HTMLImageElement): Blob => {
-  const MAX = 1000;
+// Images are capped at 800px before tracing; paths are simplified aggressively
+// to keep file size reasonable without losing recognisable shapes.
+const toTracedSVG = (img: HTMLImageElement, quality = 80): Blob => {
+  const MAX = 800;
   const scale = Math.min(1, MAX / Math.max(img.naturalWidth || 800, img.naturalHeight || 600));
   const w = Math.round((img.naturalWidth || 800) * scale);
   const h = Math.round((img.naturalHeight || 600) * scale);
@@ -57,14 +58,26 @@ const toTracedSVG = (img: HTMLImageElement): Blob => {
   const ctx = canvas.getContext('2d')!;
   ctx.drawImage(img, 0, 0, w, h);
 
+  // Map quality (1-100) to tracing detail:
+  // lower quality → fewer colors, higher error thresholds, more paths omitted → smaller file
+  const colors = Math.max(2, Math.round(2 + (quality / 100) * 14));  // 2–16
+  const errThreshold = Math.max(0.5, 8 - (quality / 100) * 7);       // 8 → 1
+  const omit = Math.max(4, Math.round(32 - (quality / 100) * 28));   // 32 → 4
+
   const imageData = ctx.getImageData(0, 0, w, h);
   const svgString: string = ImageTracer.imagedataToSVG(imageData, {
-    numberofcolors: 16,   // palette size — higher = more detail, slower
-    pathomit: 8,          // drop tiny paths below this node count
-    ltres: 1,             // straight line error threshold
-    qtres: 1,             // curve error threshold
+    numberofcolors: colors,
+    pathomit: omit,
+    ltres: errThreshold,
+    qtres: errThreshold,
     rightangleenhance: true,
-    scale: 1 / scale,     // restore original dimensions in the SVG viewBox
+    scale: 1 / scale,          // restore original dimensions in the SVG
+    roundcoords: 1,            // 1 decimal place on coordinates (vs full float)
+    blurradius: 1,             // slight blur reduces pixel noise → fewer tiny paths
+    blurdelta: 20,
+    linefilter: true,          // smooth jagged lines → fewer nodes
+    desc: false,               // skip <desc> element
+    mincolorratio: 0.02,       // drop colors covering <2% of pixels
   });
 
   return new Blob([svgString], { type: 'image/svg+xml' });
@@ -216,7 +229,7 @@ export const convertImage = async (
   const img = await loadImage(dataUrl);
 
   if (targetFormat === 'svg') {
-    return toTracedSVG(img);
+    return toTracedSVG(img, quality);
   }
 
   // JPEG doesn't support transparency — fill white background
