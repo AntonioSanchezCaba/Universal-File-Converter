@@ -1,5 +1,9 @@
 // Canvas-based image converter — works entirely in the browser
-// Supports: JPEG, PNG, WebP, BMP, SVG output, GIF output (single frame)
+// Supports: JPEG, PNG, WebP, BMP, GIF output (single frame), SVG output (traced vector)
+
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+import ImageTracer from 'imagetracerjs';
 
 const fileToDataURL = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -39,17 +43,31 @@ const canvasToBlob = (canvas: HTMLCanvasElement, mime: string, quality?: number)
     )
   );
 
-const toSVG = (img: HTMLImageElement, dataUrl: string, filename: string): Blob => {
-  const safe = filename.replace(/[<>&'"]/g, '');
-  const w = img.naturalWidth || img.width || 800;
-  const h = img.naturalHeight || img.height || 600;
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
-  <title>${safe}</title>
-  <image width="100%" height="100%" xlink:href="${dataUrl}"/>
-</svg>`;
-  return new Blob([xml], { type: 'image/svg+xml' });
+// Vectorize a raster image into real SVG paths using imagetracerjs.
+// Images are scaled down to max 1000px before tracing for reasonable speed.
+const toTracedSVG = (img: HTMLImageElement): Blob => {
+  const MAX = 1000;
+  const scale = Math.min(1, MAX / Math.max(img.naturalWidth || 800, img.naturalHeight || 600));
+  const w = Math.round((img.naturalWidth || 800) * scale);
+  const h = Math.round((img.naturalHeight || 600) * scale);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const svgString: string = ImageTracer.imagedataToSVG(imageData, {
+    numberofcolors: 16,   // palette size — higher = more detail, slower
+    pathomit: 8,          // drop tiny paths below this node count
+    ltres: 1,             // straight line error threshold
+    qtres: 1,             // curve error threshold
+    rightangleenhance: true,
+    scale: 1 / scale,     // restore original dimensions in the SVG viewBox
+  });
+
+  return new Blob([svgString], { type: 'image/svg+xml' });
 };
 
 // Single-frame GIF encoder (pure JS, no dependencies)
@@ -198,7 +216,7 @@ export const convertImage = async (
   const img = await loadImage(dataUrl);
 
   if (targetFormat === 'svg') {
-    return toSVG(img, dataUrl, file.name);
+    return toTracedSVG(img);
   }
 
   // JPEG doesn't support transparency — fill white background
