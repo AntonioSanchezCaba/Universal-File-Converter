@@ -43,13 +43,42 @@ const canvasToBlob = (canvas: HTMLCanvasElement, mime: string, quality?: number)
     )
   );
 
+// Estimate how many distinct color groups the image has (samples ~4000 pixels).
+// Returns a value 2–8 used to cap numberofcolors before tracing.
+const estimateColorComplexity = (data: Uint8ClampedArray): number => {
+  const seen = new Set<number>();
+  const total = data.length / 4;
+  const step = Math.max(1, Math.floor(total / 4000));
+  for (let i = 0; i < total; i += step) {
+    // Quantise to 32 shades per channel for broad grouping
+    const key = ((data[i * 4] >> 3) << 10) | ((data[i * 4 + 1] >> 3) << 5) | (data[i * 4 + 2] >> 3);
+    seen.add(key);
+    if (seen.size >= 8) return 8; // cap early once we know it's complex
+  }
+  return Math.max(2, seen.size);
+};
+
+// Clean up the SVG string imagetracerjs produces:
+//   - round opacity="0.7843137254901961" → opacity="0.78"
+//   - round long floats inside path d="..." to 1 decimal place
+//   - strip the verbose version comment
+const cleanSVG = (svg: string): string =>
+  svg
+    .replace(/\s+version="[^"]*"/, '')           // remove version attr
+    .replace(/\s+desc="[^"]*"/, '')              // remove desc attr if any
+    .replace(/opacity="([\d.]{5,})"/g, (_, v) => `opacity="${parseFloat(v).toFixed(2)}"`)
+    .replace(/([\d]+\.\d{3,})/g, (_, v) => parseFloat(v).toFixed(1));
+
 // Vectorize a raster image into real SVG paths using imagetracerjs.
-// Images are scaled down to max 1000px before tracing for reasonable speed.
-const toTracedSVG = (img: HTMLImageElement): Blob => {
-  const MAX = 1000;
-  const scale = Math.min(1, MAX / Math.max(img.naturalWidth || 800, img.naturalHeight || 600));
-  const w = Math.round((img.naturalWidth || 800) * scale);
-  const h = Math.round((img.naturalHeight || 600) * scale);
+// Resolution is capped at 512px before tracing — this is the single biggest
+// factor for output size since it directly limits coordinate magnitude.
+const toTracedSVG = (img: HTMLImageElement, quality = 80): Blob => {
+  const MAX = 512;
+  const origW = img.naturalWidth || img.width || 800;
+  const origH = img.naturalHeight || img.height || 600;
+  const scale = Math.min(1, MAX / Math.max(origW, origH));
+  const w = Math.round(origW * scale);
+  const h = Math.round(origH * scale);
 
   const canvas = document.createElement('canvas');
   canvas.width = w;
@@ -58,16 +87,30 @@ const toTracedSVG = (img: HTMLImageElement): Blob => {
   ctx.drawImage(img, 0, 0, w, h);
 
   const imageData = ctx.getImageData(0, 0, w, h);
+
+  // Cap color count to image complexity — no point tracing 16 colors on a B&W icon
+  const maxColors = estimateColorComplexity(imageData.data);
+  const colors = Math.min(maxColors, Math.max(2, Math.round(2 + (quality / 100) * 6))); // 2–8
+  const err    = Math.max(1, 10 - (quality / 100) * 8);    // 10 → 2  (fewer nodes)
+  const omit   = Math.max(8, Math.round(48 - (quality / 100) * 40)); // 48 → 8
+
   const svgString: string = ImageTracer.imagedataToSVG(imageData, {
-    numberofcolors: 16,   // palette size — higher = more detail, slower
-    pathomit: 8,          // drop tiny paths below this node count
-    ltres: 1,             // straight line error threshold
-    qtres: 1,             // curve error threshold
+    numberofcolors:  colors,
+    pathomit:        omit,
+    ltres:           err,
+    qtres:           err,
     rightangleenhance: true,
-    scale: 1 / scale,     // restore original dimensions in the SVG viewBox
+    scale:           1 / scale,  // restore original dimensions in the output SVG
+    roundcoords:     1,          // 1 decimal place on all coordinates
+    blurradius:      1,          // smooth pixel noise → fewer tiny paths
+    blurdelta:       20,
+    linefilter:      true,       // reduce jagged pixel edges → fewer nodes
+    desc:            false,
+    mincolorratio:   0.03,       // drop colors that cover <3% of pixels
+    colorquantcycles: 2,         // was 3 — faster, still accurate enough
   });
 
-  return new Blob([svgString], { type: 'image/svg+xml' });
+  return new Blob([cleanSVG(svgString)], { type: 'image/svg+xml' });
 };
 
 // Single-frame GIF encoder (pure JS, no dependencies)
@@ -216,7 +259,7 @@ export const convertImage = async (
   const img = await loadImage(dataUrl);
 
   if (targetFormat === 'svg') {
-    return toTracedSVG(img);
+    return toTracedSVG(img, quality);
   }
 
   // JPEG doesn't support transparency — fill white background
