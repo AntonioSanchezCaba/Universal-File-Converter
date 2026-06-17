@@ -18,6 +18,7 @@ interface DocLine {
 interface PageContent {
   lines: DocLine[];
   pageNum: number;
+  image?: { data: Uint8Array; width: number; height: number }; // rendered page PNG
 }
 
 // Replace sequences of replacement chars (garbled PDF font encoding) sensibly.
@@ -25,9 +26,43 @@ interface PageContent {
 // Single/double → remove them.
 const cleanStr = (s: string): string =>
   s
-    .replace(/�{3,}/g, '···') // long garbled runs → ···
-    .replace(/�+/g, '')                        // leftover single replacements
+    .replace(/�{3,}/g, '···')
+    .replace(/�+/g, '')
     .trim();
+
+// Render a PDF page to PNG bytes. Returns null if rendering fails.
+const renderPageToPng = async (
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  page: any,
+  displayWidthPx: number
+): Promise<{ data: Uint8Array; width: number; height: number } | null> => {
+  try {
+    const viewport = page.getViewport({ scale: 1 });
+    const scale = displayWidthPx / viewport.width;
+    const scaledVP = page.getViewport({ scale });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(scaledVP.width);
+    canvas.height = Math.round(scaledVP.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    await page.render({ canvasContext: ctx, viewport: scaledVP }).promise;
+
+    const blob = await new Promise<Blob | null>(res => canvas.toBlob(b => res(b), 'image/png'));
+    if (!blob) return null;
+    return {
+      data: new Uint8Array(await blob.arrayBuffer()),
+      width: canvas.width,
+      height: canvas.height,
+    };
+  } catch {
+    return null;
+  }
+};
+
+// pdfjs operator codes for image painting (numeric constants)
+const IMAGE_OPS = new Set([83, 84, 85]); // paintInlineImageXObject, paintImageMaskXObject, paintImageXObject
 
 const extractPDFPages = async (file: File): Promise<PageContent[]> => {
   const pdfjsLib = await import('pdfjs-dist');
@@ -42,9 +77,14 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
-    const content = await page.getTextContent();
+    const [content, opList] = await Promise.all([
+      page.getTextContent(),
+      page.getOperatorList(),
+    ]);
 
-    // Collect raw items, drop purely whitespace/garbled strings
+    const hasImages = opList.fnArray.some((fn: number) => IMAGE_OPS.has(fn));
+
+    // Collect raw text items, drop purely whitespace/garbled strings
     const items: TextItem[] = [];
     for (const raw of content.items) {
       if (!('str' in raw)) continue;
@@ -58,15 +98,16 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
       });
     }
 
-    if (items.length === 0) { pages.push({ lines: [], pageNum: p }); continue; }
-
     // Determine the dominant (body) font size — most frequently occurring
-    const sizeCount = new Map<number, number>();
-    for (const it of items) {
-      const sz = Math.round(it.height);
-      sizeCount.set(sz, (sizeCount.get(sz) ?? 0) + 1);
+    let bodySize = 12;
+    if (items.length > 0) {
+      const sizeCount = new Map<number, number>();
+      for (const it of items) {
+        const sz = Math.round(it.height);
+        sizeCount.set(sz, (sizeCount.get(sz) ?? 0) + 1);
+      }
+      bodySize = [...sizeCount.entries()].sort((a, b) => b[1] - a[1])[0][0];
     }
-    const bodySize = [...sizeCount.entries()].sort((a, b) => b[1] - a[1])[0][0];
 
     // Group items into lines by rounded Y position (PDF Y is bottom-up)
     const lineMap = new Map<number, TextItem[]>();
@@ -81,7 +122,6 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
     for (const [, lineItems] of [...lineMap.entries()].sort(([a], [b]) => b - a)) {
       lineItems.sort((a, b) => a.x - b.x);
 
-      // Join items, collapsing duplicate spaces and fixing hyphenation at line ends
       let text = lineItems.map(it => it.str).join(' ').replace(/\s+/g, ' ').trim();
       // Fix soft hyphens: "in- structions" → "instructions"
       text = text.replace(/(\w)-\s+(\w)/g, '$1$2');
@@ -94,7 +134,11 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
       docLines.push({ text, fontSize: Math.round(avgSize), isHeading });
     }
 
-    pages.push({ lines: docLines, pageNum: p });
+    // Render page image if it contains image operators
+    // Display width = 6 inches at 96 DPI = 576px
+    const image = hasImages ? await renderPageToPng(page, 576) ?? undefined : undefined;
+
+    pages.push({ lines: docLines, pageNum: p, image });
   }
 
   return pages;
@@ -102,19 +146,17 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
 
 // Build a DOCX from extracted pages
 const buildDocx = async (pages: PageContent[], title: string): Promise<Blob> => {
-  const { Document, Packer, Paragraph, TextRun, PageBreak, HeadingLevel } = await import('docx');
+  const { Document, Packer, Paragraph, TextRun, PageBreak, HeadingLevel, ImageRun } = await import('docx');
 
   const children = [];
 
   for (let i = 0; i < pages.length; i++) {
-    const { lines } = pages[i];
-    if (lines.length === 0) continue;
+    const { lines, image } = pages[i];
+    if (lines.length === 0 && !image) continue;
 
     // Page break before each page except the first
     if (i > 0) {
-      children.push(
-        new Paragraph({ children: [new PageBreak()] })
-      );
+      children.push(new Paragraph({ children: [new PageBreak()] }));
     }
 
     for (const line of lines) {
@@ -134,6 +176,22 @@ const buildDocx = async (pages: PageContent[], title: string): Promise<Blob> => 
           })
         );
       }
+    }
+
+    // Embed rendered page image after text (diagrams, photos, etc.)
+    if (image) {
+      children.push(
+        new Paragraph({
+          children: [
+            new ImageRun({
+              data: image.data,
+              transformation: { width: image.width, height: image.height },
+              type: 'png',
+            }),
+          ],
+          spacing: { before: 120, after: 120 },
+        })
+      );
     }
   }
 
