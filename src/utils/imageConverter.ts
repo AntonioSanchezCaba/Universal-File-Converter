@@ -299,12 +299,61 @@ const toICO = async (img: HTMLImageElement): Promise<Blob> => {
   return new Blob([buf], { type: 'image/x-icon' });
 };
 
+// 24-bit BMP encoder — canvas.toBlob('image/bmp') only works in Chrome.
+// This pure-JS implementation works in all browsers.
+// BMP: BGR pixel order, rows stored bottom-up, each row padded to 4 bytes.
+const toBMP = (canvas: HTMLCanvasElement): Blob => {
+  const ctx = canvas.getContext('2d')!;
+  const { width, height } = canvas;
+  const { data } = ctx.getImageData(0, 0, width, height);
+
+  const rowSize = Math.floor((24 * width + 31) / 32) * 4; // padded row bytes
+  const pixelBytes = rowSize * height;
+  const fileSize = 54 + pixelBytes;
+
+  const buf  = new ArrayBuffer(fileSize);
+  const view = new DataView(buf);
+  const u8   = new Uint8Array(buf);
+
+  // BITMAPFILEHEADER (14 bytes)
+  u8[0] = 0x42; u8[1] = 0x4d;          // 'BM'
+  view.setUint32(2,  fileSize,   true); // file size
+  view.setUint32(6,  0,          true); // reserved
+  view.setUint32(10, 54,         true); // pixel data offset
+
+  // BITMAPINFOHEADER (40 bytes)
+  view.setUint32(14, 40,         true); // header size
+  view.setInt32 (18, width,      true); // image width
+  view.setInt32 (22, height,     true); // image height (positive = bottom-up)
+  view.setUint16(26, 1,          true); // color planes
+  view.setUint16(28, 24,         true); // bits per pixel
+  view.setUint32(30, 0,          true); // compression (BI_RGB = none)
+  view.setUint32(34, pixelBytes, true); // raw image size
+  view.setUint32(38, 2835,       true); // X px/meter (~72 dpi)
+  view.setUint32(42, 2835,       true); // Y px/meter
+  view.setUint32(46, 0,          true); // colors in table
+  view.setUint32(50, 0,          true); // important colors
+
+  // Pixel data — flip rows vertically, write BGR
+  for (let y = 0; y < height; y++) {
+    const bmpRow = height - 1 - y;
+    for (let x = 0; x < width; x++) {
+      const src = (y * width + x) * 4;
+      const dst = 54 + bmpRow * rowSize + x * 3;
+      u8[dst]     = data[src + 2]; // B
+      u8[dst + 1] = data[src + 1]; // G
+      u8[dst + 2] = data[src];     // R
+    }
+  }
+
+  return new Blob([buf], { type: 'image/bmp' });
+};
+
 const FORMAT_MIME: Record<string, string> = {
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
   png: 'image/png',
   webp: 'image/webp',
-  bmp: 'image/bmp',
 };
 
 const LOSSY_FORMATS = new Set(['jpg', 'jpeg', 'webp']);
@@ -320,11 +369,12 @@ export const convertImage = async (
   if (targetFormat === 'svg') return toTracedSVG(img, quality);
   if (targetFormat === 'ico') return toICO(img);
 
-  // JPEG and GIF don't support transparency — fill white background
-  const needsWhiteBg = targetFormat === 'jpg' || targetFormat === 'jpeg' || targetFormat === 'gif';
+  // JPEG, GIF and BMP don't support transparency — composite onto white first
+  const needsWhiteBg = ['jpg', 'jpeg', 'gif', 'bmp'].includes(targetFormat);
   const canvas = drawToCanvas(img, needsWhiteBg);
 
   if (targetFormat === 'gif') return encodeGIF(canvas);
+  if (targetFormat === 'bmp') return toBMP(canvas);
 
   const mime = FORMAT_MIME[targetFormat];
   if (!mime) throw new Error(`Unsupported image format: ${targetFormat}`);
