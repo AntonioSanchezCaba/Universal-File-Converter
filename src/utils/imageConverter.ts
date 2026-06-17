@@ -240,6 +240,65 @@ const encodeGIF = (canvas: HTMLCanvasElement): Blob => {
   return new Blob([new Uint8Array(out)], { type: 'image/gif' });
 };
 
+// Build a multi-size ICO file containing PNG frames at 16, 32, 48 and 256 px.
+// Each frame is a standard PNG blob embedded directly in the ICO container
+// (Vista+ / "PNG ICO" format — supported by all modern OS and browsers).
+const toICO = async (img: HTMLImageElement): Promise<Blob> => {
+  const origMax = Math.max(img.naturalWidth || 32, img.naturalHeight || 32);
+  const allSizes = [16, 32, 48, 256];
+  const sizes = allSizes.filter(s => s <= origMax);
+  if (sizes.length === 0) sizes.push(origMax); // very small source image
+
+  // Render each size to a PNG blob
+  const pngDatas: Uint8Array[] = await Promise.all(
+    sizes.map(async size => {
+      const c = document.createElement('canvas');
+      c.width = size;
+      c.height = size;
+      c.getContext('2d')!.drawImage(img, 0, 0, size, size);
+      const blob = await canvasToBlob(c, 'image/png');
+      return new Uint8Array(await blob.arrayBuffer());
+    })
+  );
+
+  const count = sizes.length;
+  const HEADER = 6;
+  const ENTRY  = 16;
+  const dataStart = HEADER + count * ENTRY;
+  const totalBytes = dataStart + pngDatas.reduce((s, d) => s + d.length, 0);
+
+  const buf  = new ArrayBuffer(totalBytes);
+  const view = new DataView(buf);
+  const u8   = new Uint8Array(buf);
+
+  // ICONDIR
+  view.setUint16(0, 0, true);      // reserved
+  view.setUint16(2, 1, true);      // type = 1 (icon)
+  view.setUint16(4, count, true);  // image count
+
+  // ICONDIRENTRY + image data
+  let offset = dataStart;
+  for (let i = 0; i < count; i++) {
+    const size = sizes[i];
+    const png  = pngDatas[i];
+    const base = HEADER + i * ENTRY;
+
+    view.setUint8 (base,      size === 256 ? 0 : size); // width  (0 means 256)
+    view.setUint8 (base + 1,  size === 256 ? 0 : size); // height
+    view.setUint8 (base + 2,  0);    // palette size (0 = no palette)
+    view.setUint8 (base + 3,  0);    // reserved
+    view.setUint16(base + 4,  1,  true); // color planes
+    view.setUint16(base + 6,  32, true); // bits per pixel
+    view.setUint32(base + 8,  png.length, true); // image byte size
+    view.setUint32(base + 12, offset,     true); // offset from file start
+
+    u8.set(png, offset);
+    offset += png.length;
+  }
+
+  return new Blob([buf], { type: 'image/x-icon' });
+};
+
 const FORMAT_MIME: Record<string, string> = {
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
@@ -258,17 +317,14 @@ export const convertImage = async (
   const dataUrl = await fileToDataURL(file);
   const img = await loadImage(dataUrl);
 
-  if (targetFormat === 'svg') {
-    return toTracedSVG(img, quality);
-  }
+  if (targetFormat === 'svg') return toTracedSVG(img, quality);
+  if (targetFormat === 'ico') return toICO(img);
 
   // JPEG and GIF don't support transparency — fill white background
   const needsWhiteBg = targetFormat === 'jpg' || targetFormat === 'jpeg' || targetFormat === 'gif';
   const canvas = drawToCanvas(img, needsWhiteBg);
 
-  if (targetFormat === 'gif') {
-    return encodeGIF(canvas);
-  }
+  if (targetFormat === 'gif') return encodeGIF(canvas);
 
   const mime = FORMAT_MIME[targetFormat];
   if (!mime) throw new Error(`Unsupported image format: ${targetFormat}`);
