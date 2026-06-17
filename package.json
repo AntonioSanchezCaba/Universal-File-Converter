@@ -10,8 +10,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "docx": "^9.7.1",
     "imagetracerjs": "^1.2.6",
     "lucide-react": "^0.344.0",
+    "pdfjs-dist": "^6.0.227",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.22.3"
