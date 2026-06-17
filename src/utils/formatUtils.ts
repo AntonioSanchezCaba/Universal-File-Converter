@@ -13,6 +13,7 @@ export const formatDefinitions: FormatOption[] = [
   
   // Document Formats
   { extension: 'pdf', name: 'PDF Document', category: 'document', mimeType: 'application/pdf' },
+  { extension: 'docx', name: 'Word Document', category: 'document', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
   { extension: 'txt', name: 'Text Document', category: 'document', mimeType: 'text/plain' },
   { extension: 'html', name: 'HTML Document', category: 'document', mimeType: 'text/html' },
   { extension: 'md', name: 'Markdown Document', category: 'document', mimeType: 'text/markdown' },

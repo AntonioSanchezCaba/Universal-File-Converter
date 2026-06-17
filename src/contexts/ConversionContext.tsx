@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useCallback } from 'react';
 import { ConversionSettings, ConversionStatus, FormatCategory } from '../types/converter';
 import { getFormatFromMimeType } from '../utils/formatUtils';
 import { convertImage } from '../utils/imageConverter';
+import { convertDocument } from '../utils/documentConverter';
 
 interface ConversionContextType {
   files: File[];
@@ -75,8 +76,18 @@ export const ConversionProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   });
 
   const convertFile = async (file: File, format: string, quality: number): Promise<Blob> => {
-    if (file.type.startsWith('image/') || file.type === 'image/svg+xml') {
+    if (file.type.startsWith('image/')) {
       return convertImage(file, format, quality);
+    }
+    if (
+      file.type === 'application/pdf' ||
+      file.type === 'text/plain' ||
+      file.type === 'text/html' ||
+      file.type === 'text/markdown' ||
+      file.name.endsWith('.md') ||
+      file.name.endsWith('.txt')
+    ) {
+      return convertDocument(file, format);
     }
     throw new Error(`Conversion from "${file.type}" to "${format}" is not yet supported`);
   };
