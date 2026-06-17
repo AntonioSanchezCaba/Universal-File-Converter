@@ -37,10 +37,16 @@ const OPS = { save: 10, restore: 11, transform: 12, paintImageMaskXObject: 83, p
 interface ImageRegion { xMin: number; yMin: number; xMax: number; yMax: number; yCenter: number }
 
 // Walk the operator list tracking the current transform matrix to find image bounding boxes.
-const trackImageRegions = (opList: { fnArray: number[]; argsArray: unknown[][] }): ImageRegion[] => {
+// pageW/pageH in PDF points — used to skip full-page background images.
+const trackImageRegions = (
+  opList: { fnArray: number[]; argsArray: unknown[][] },
+  pageW: number,
+  pageH: number,
+): ImageRegion[] => {
   const regions: ImageRegion[] = [];
   let ctm = [1, 0, 0, 1, 0, 0]; // [a,b,c,d,e,f] identity
   const stack: number[][] = [];
+  const pageArea = pageW * pageH;
 
   const mul = (m: number[], n: number[]): number[] => [
     m[0]*n[0] + m[1]*n[2],
@@ -62,13 +68,16 @@ const trackImageRegions = (opList: { fnArray: number[]; argsArray: unknown[][] }
       ctm = mul(ctm, args);
     } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
       const [a, b, c, d, e, f] = ctm;
-      // Image is painted in a 1×1 unit square in current CTM
       const xs = [e, a+e, c+e, a+c+e];
       const ys = [f, b+f, d+f, b+d+f];
       const xMin = Math.min(...xs), xMax = Math.max(...xs);
       const yMin = Math.min(...ys), yMax = Math.max(...ys);
-      // Skip tiny images (bullets, hairlines, small icons < 20pt)
-      if (xMax - xMin < 20 || yMax - yMin < 20) continue;
+      const imgW = xMax - xMin, imgH = yMax - yMin;
+      // Skip tiny images (bullets, hairlines < 20pt)
+      if (imgW < 20 || imgH < 20) continue;
+      // Skip full-page background images (> 60% of page area) — those are background layers,
+      // not content images. Diagram pages are handled separately via full-page render.
+      if ((imgW * imgH) / pageArea > 0.60) continue;
       // Deduplicate: skip if very similar to last region
       const last = regions[regions.length - 1];
       if (last && Math.abs(last.xMin - xMin) < 5 && Math.abs(last.yMin - yMin) < 5) continue;
@@ -160,12 +169,29 @@ const extractPDFItems = async (file: File): Promise<DocItem[][]> => {
       page.getOperatorList(),
     ]);
 
-    const imageRegions = trackImageRegions(opList as { fnArray: number[]; argsArray: unknown[][] });
+    const imageRegions = trackImageRegions(
+      opList as { fnArray: number[]; argsArray: unknown[][] },
+      viewport.width,
+      pageHeight,
+    );
 
-    // Render page only if it has extractable images
+    // Render page only when needed: either sub-page images exist, or
+    // it's a diagram page (has image ops but very little text → render entire page).
+    const hasAnyImageOp = (opList.fnArray as number[]).some(fn =>
+      fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject
+    );
     let pageCanvas: HTMLCanvasElement | null = null;
+    let isDiagramPage = false;
     if (imageRegions.length > 0) {
       pageCanvas = await renderPage(page, RENDER_SCALE);
+    } else if (hasAnyImageOp) {
+      // Page has images but they were all filtered as backgrounds.
+      // If the page also has very little text, treat the whole page as a diagram.
+      const rawTextCount = content.items.filter((r: unknown) => 'str' in (r as object) && cleanStr((r as {str:string}).str)).length;
+      if (rawTextCount < 8) {
+        isDiagramPage = true;
+        pageCanvas = await renderPage(page, RENDER_SCALE);
+      }
     }
 
     // Collect text items, excluding header/footer zones
@@ -230,14 +256,20 @@ const extractPDFItems = async (file: File): Promise<DocItem[][]> => {
 
     // Build image items from regions
     const docImages: DocImage[] = [];
-    if (pageCanvas) {
+    if (pageCanvas && isDiagramPage) {
+      // Whole page is a diagram — embed it as one image at mid-page Y
+      const result = await cropRegion(
+        pageCanvas,
+        { xMin: 0, yMin: 0, xMax: viewport.width, yMax: pageHeight, yCenter: pageHeight / 2 },
+        pageHeight,
+        RENDER_SCALE,
+      );
+      if (result) docImages.push({ kind: 'image', ...result, y: pageHeight / 2 });
+    } else if (pageCanvas) {
       for (const region of imageRegions) {
-        // Skip images in header/footer zones
         if (region.yCenter > headerMinY || region.yCenter < footerMaxY) continue;
         const result = await cropRegion(pageCanvas, region, pageHeight, RENDER_SCALE);
-        if (result) {
-          docImages.push({ kind: 'image', ...result, y: region.yCenter });
-        }
+        if (result) docImages.push({ kind: 'image', ...result, y: region.yCenter });
       }
     }
 
