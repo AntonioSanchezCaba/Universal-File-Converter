@@ -18,19 +18,15 @@ interface DocLine {
 interface PageContent {
   lines: DocLine[];
   pageNum: number;
-  image?: { data: Uint8Array; width: number; height: number }; // rendered page PNG
+  image?: { data: Uint8Array; width: number; height: number };
 }
 
-// Replace sequences of replacement chars (garbled PDF font encoding) sensibly.
-// ≥3 in a row → "···" (likely dot leaders in TOC or decorative).
-// Single/double → remove them.
+// Replace sequences of replacement chars (garbled PDF font encoding).
+// ≥3 in a row → "···" (TOC dot leaders), single/double → remove.
 const cleanStr = (s: string): string =>
-  s
-    .replace(/�{3,}/g, '···')
-    .replace(/�+/g, '')
-    .trim();
+  s.replace(/�{3,}/g, '···').replace(/�+/g, '').trim();
 
-// Render a PDF page to PNG bytes. Returns null if rendering fails.
+// Render a PDF page to PNG bytes at a given display width.
 const renderPageToPng = async (
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   page: any,
@@ -61,7 +57,7 @@ const renderPageToPng = async (
   }
 };
 
-// pdfjs operator codes for image painting (numeric constants)
+// pdfjs operator codes for image painting
 const IMAGE_OPS = new Set([83, 84, 85]); // paintInlineImageXObject, paintImageMaskXObject, paintImageXObject
 
 const extractPDFPages = async (file: File): Promise<PageContent[]> => {
@@ -77,6 +73,13 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
+    const viewport = page.getViewport({ scale: 1 });
+    const pageHeight = viewport.height;
+
+    // Header zone: top 8% of page; footer zone: bottom 6%
+    const headerMinY = pageHeight * 0.92;
+    const footerMaxY = pageHeight * 0.06;
+
     const [content, opList] = await Promise.all([
       page.getTextContent(),
       page.getOperatorList(),
@@ -84,21 +87,24 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
 
     const hasImages = opList.fnArray.some((fn: number) => IMAGE_OPS.has(fn));
 
-    // Collect raw text items, drop purely whitespace/garbled strings
+    // Collect raw text items, skip headers/footers and garbled/empty strings
     const items: TextItem[] = [];
     for (const raw of content.items) {
       if (!('str' in raw)) continue;
       const str = cleanStr(raw.str);
       if (!str) continue;
+      const y = raw.transform[5] as number;
+      // Skip running headers and footers
+      if (y > headerMinY || y < footerMaxY) continue;
       items.push({
         str,
         x: raw.transform[4] as number,
-        y: raw.transform[5] as number,
+        y,
         height: (raw.height as number) || Math.abs(raw.transform[3] as number) || 12,
       });
     }
 
-    // Determine the dominant (body) font size — most frequently occurring
+    // Determine dominant (body) font size — most frequently occurring
     let bodySize = 12;
     if (items.length > 0) {
       const sizeCount = new Map<number, number>();
@@ -118,25 +124,36 @@ const extractPDFPages = async (file: File): Promise<PageContent[]> => {
     }
 
     // Sort lines top-to-bottom (descending Y), items left-to-right within each line
-    const docLines: DocLine[] = [];
+    const rawLines: DocLine[] = [];
     for (const [, lineItems] of [...lineMap.entries()].sort(([a], [b]) => b - a)) {
       lineItems.sort((a, b) => a.x - b.x);
 
-      let text = lineItems.map(it => it.str).join(' ').replace(/\s+/g, ' ').trim();
-      // Fix soft hyphens: "in- structions" → "instructions"
-      text = text.replace(/(\w)-\s+(\w)/g, '$1$2');
-
+      const text = lineItems.map(it => it.str).join(' ').replace(/\s+/g, ' ').trim();
       if (!text) continue;
 
       const avgSize = lineItems.reduce((s, it) => s + it.height, 0) / lineItems.length;
       const isHeading = avgSize > bodySize * 1.25 && text.length < 120;
 
-      docLines.push({ text, fontSize: Math.round(avgSize), isHeading });
+      rawLines.push({ text, fontSize: Math.round(avgSize), isHeading });
     }
 
-    // Render page image if it contains image operators
-    // Display width = 6 inches at 96 DPI = 576px
-    const image = hasImages ? await renderPageToPng(page, 576) ?? undefined : undefined;
+    // Join lines where a line ends with a hyphen into the next line
+    // (handles words split across visual lines in the PDF)
+    const docLines: DocLine[] = [];
+    for (let i = 0; i < rawLines.length; i++) {
+      const line = rawLines[i];
+      if (line.text.endsWith('-') && i + 1 < rawLines.length && !rawLines[i + 1].isHeading) {
+        const joined = line.text.slice(0, -1) + rawLines[i + 1].text;
+        docLines.push({ text: joined, fontSize: line.fontSize, isHeading: line.isHeading });
+        i++; // skip next line — already consumed
+      } else {
+        docLines.push(line);
+      }
+    }
+
+    // Render page to PNG if it has image operators (diagrams, photos, etc.)
+    // Display at 6 inches wide (96 DPI screen = 576px)
+    const image = hasImages ? (await renderPageToPng(page, 576)) ?? undefined : undefined;
 
     pages.push({ lines: docLines, pageNum: p, image });
   }
@@ -178,7 +195,7 @@ const buildDocx = async (pages: PageContent[], title: string): Promise<Blob> => 
       }
     }
 
-    // Embed rendered page image after text (diagrams, photos, etc.)
+    // Embed rendered page image after text (for pages with diagrams/photos)
     if (image) {
       children.push(
         new Paragraph({
