@@ -262,8 +262,8 @@ export const convertImage = async (
     return toTracedSVG(img, quality);
   }
 
-  // JPEG doesn't support transparency — fill white background
-  const needsWhiteBg = targetFormat === 'jpg' || targetFormat === 'jpeg';
+  // JPEG and GIF don't support transparency — fill white background
+  const needsWhiteBg = targetFormat === 'jpg' || targetFormat === 'jpeg' || targetFormat === 'gif';
   const canvas = drawToCanvas(img, needsWhiteBg);
 
   if (targetFormat === 'gif') {
